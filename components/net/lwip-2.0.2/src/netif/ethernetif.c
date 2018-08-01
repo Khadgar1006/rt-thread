@@ -173,10 +173,26 @@ static err_t eth_netif_device_init(struct netif *netif)
         netif->flags = (ethif->flags & 0xff);
 
 #if LWIP_IPV6
-		netif->output_ip6 = ethip6_output;
-		netif->ip6_autoconfig_enabled = 1;
-		netif_create_ip6_linklocal_address(netif, 1);
-		netif->flags |= NETIF_FLAG_MLD6;
+        netif->output_ip6 = ethip6_output;
+        netif->ip6_autoconfig_enabled = 1;
+        netif_create_ip6_linklocal_address(netif, 1);
+
+#if LWIP_IPV6_MLD
+        netif->flags |= NETIF_FLAG_MLD6;
+
+        /*
+        * For hardware/netifs that implement MAC filtering.
+        * All-nodes link-local is handled by default, so we must let the hardware know
+        * to allow multicast packets in.
+        * Should set mld_mac_filter previously. */
+        if (netif->mld_mac_filter != NULL)
+        {
+            ip6_addr_t ip6_allnodes_ll;
+            ip6_addr_set_allnodes_linklocal(&ip6_allnodes_ll);
+            netif->mld_mac_filter(netif, &ip6_allnodes_ll, NETIF_ADD_MAC_FILTER);
+        }
+#endif /* LWIP_IPV6_MLD */
+
 #endif /* LWIP_IPV6 */
 
         /* set default netif */
@@ -547,6 +563,7 @@ void list_if(void)
         if (netif->flags & NETIF_FLAG_LINK_UP) rt_kprintf(" LINK_UP");
         else rt_kprintf(" LINK_DOWN");
         if (netif->flags & NETIF_FLAG_ETHARP) rt_kprintf(" ETHARP");
+        if (netif->flags & NETIF_FLAG_BROADCAST) rt_kprintf(" BROADCAST");
         if (netif->flags & NETIF_FLAG_IGMP) rt_kprintf(" IGMP");
         rt_kprintf("\n");
         rt_kprintf("ip address: %s\n", ipaddr_ntoa(&(netif->ip_addr)));
@@ -656,6 +673,36 @@ void list_tcps(void)
     rt_exit_critical();
 }
 FINSH_FUNCTION_EXPORT(list_tcps, list all of tcp connections);
-#endif
+#endif /* LWIP_TCP */
+
+#if LWIP_UDP
+#include "lwip/udp.h"
+void list_udps(void)
+{
+    struct udp_pcb *pcb;
+    rt_uint32_t num = 0;
+    char local_ip_str[16];
+    char remote_ip_str[16];
+
+    rt_enter_critical();
+    rt_kprintf("Active UDP PCB states:\n");
+    for (pcb = udp_pcbs; pcb != NULL; pcb = pcb->next)
+    {
+        strcpy(local_ip_str, ipaddr_ntoa(&(pcb->local_ip)));
+        strcpy(remote_ip_str, ipaddr_ntoa(&(pcb->remote_ip)));
+
+        rt_kprintf("#%d %d %s:%d <==> %s:%d \n",
+                   num, (int)pcb->flags,
+                   local_ip_str,
+                   pcb->local_port,
+                   remote_ip_str,
+                   pcb->remote_port);
+
+        num++;
+    }
+    rt_exit_critical();
+}
+FINSH_FUNCTION_EXPORT(list_udps, list all of udp connections);
+#endif /* LWIP_UDP */
 
 #endif
