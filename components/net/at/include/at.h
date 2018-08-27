@@ -27,7 +27,10 @@
 
 #include <rtthread.h>
 
-#define AT_SW_VERSION                  "0.2.2"
+#ifdef __cplusplus
+extern "C" {
+#endif
+#define AT_SW_VERSION                  "0.3.0"
 
 #define DBG_ENABLE
 #define DBG_SECTION_NAME               "AT"
@@ -216,6 +219,9 @@ int at_req_parse_args(const char *req_args, const char *req_expr, ...);
 /* AT client initialize and start */
 int at_client_init(void);
 
+/* AT client wait for connection to external devices. */
+int at_client_wait_connect(rt_uint32_t timeout);
+
 /* AT client send commands to AT server and waiter response */
 int at_exec_cmd(at_response_t resp, const char *cmd_expr, ...);
 
@@ -248,9 +254,8 @@ void at_port_reset(void);
 void at_port_factory_reset(void);
 #endif
 
-#ifdef AT_USING_CLIENT
-/* AT client port initialization */
-int at_client_port_init(void);
+#ifdef __cplusplus
+}
 #endif
 
 #endif /* __AT_H__ */

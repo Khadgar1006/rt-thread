@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <sys/time.h>
 
 #include <at_socket.h>
 
@@ -35,9 +36,8 @@
 
 #ifdef DBG_SECTION_NAME
 #undef DBG_SECTION_NAME
-#define DBG_SECTION_NAME     "[AT_SOC] "
+#define DBG_SECTION_NAME     "AT_SOC"
 #endif
-
 
 #define HTONS_PORT(x) ((((x) & 0x00ffUL) << 8) | (((x) & 0xff00UL) >> 8))
 #define NIPQUAD(addr) \
@@ -63,8 +63,6 @@ typedef enum {
 
 /* the global array of available sockets */
 static struct at_socket sockets[AT_SOCKETS_NUM] = { 0 };
-/* the global AT socket lock */
-static rt_mutex_t at_socket_lock = RT_NULL;
 /* AT device socket options */
 static struct at_device_ops *at_dev_ops = RT_NULL;
 
@@ -90,7 +88,7 @@ static size_t at_recvpkt_put(rt_slist_t *rlist, const char *ptr, size_t length)
     at_recv_pkt_t pkt;
 
     pkt = (at_recv_pkt_t) rt_calloc(1, sizeof(struct at_recv_pkt));
-    if (!pkt)
+    if (pkt == RT_NULL)
     {
         LOG_E("No memory for receive packet table!");
         return 0;
@@ -256,12 +254,23 @@ static void at_do_event_changes(struct at_socket *sock, at_event_t event, rt_boo
 
 static struct at_socket *alloc_socket(void)
 {
-    char sem_name[RT_NAME_MAX];
-    char lock_name[RT_NAME_MAX];
+    static rt_mutex_t at_slock = RT_NULL;
+    char name[RT_NAME_MAX];
     struct at_socket *sock;
     int idx;
 
-    rt_mutex_take(at_socket_lock, RT_WAITING_FOREVER);
+    if(at_slock == RT_NULL)
+    {
+        /* create AT socket lock */
+        at_slock = rt_mutex_create("at_s", RT_IPC_FLAG_FIFO);
+        if (at_slock == RT_NULL)
+        {
+            LOG_E("No memory for AT socket lock!");
+            return RT_NULL;
+        }
+    }
+
+    rt_mutex_take(at_slock, RT_WAITING_FOREVER);
 
     /* find an empty at socket entry */
     for (idx = 0; idx < AT_SOCKETS_NUM && sockets[idx].magic; idx++);
@@ -281,25 +290,25 @@ static struct at_socket *alloc_socket(void)
     sock->errevent = RT_NULL;
     rt_slist_init(&sock->recvpkt_list);
 
-    rt_snprintf(sem_name, RT_NAME_MAX, "%s%d", "at_recv_notice_", idx);
+    rt_snprintf(name, RT_NAME_MAX, "%s%d", "at_sr", idx);
     /* create AT socket receive mailbox */
-    if ((sock->recv_notice = rt_sem_create(sem_name, 0, RT_IPC_FLAG_FIFO)) == RT_NULL)
+    if ((sock->recv_notice = rt_sem_create(name, 0, RT_IPC_FLAG_FIFO)) == RT_NULL)
     {
         goto __err;
     }
 
-    rt_snprintf(lock_name, RT_NAME_MAX, "%s%d", "at_recv_lock_", idx);
+    rt_snprintf(name, RT_NAME_MAX, "%s%d", "at_sr", idx);
     /* create AT socket receive ring buffer lock */
-    if((sock->recv_lock = rt_mutex_create(lock_name, RT_IPC_FLAG_FIFO)) == RT_NULL)
+    if((sock->recv_lock = rt_mutex_create(name, RT_IPC_FLAG_FIFO)) == RT_NULL)
     {
         goto __err;
     }
 
-    rt_mutex_release(at_socket_lock);
+    rt_mutex_release(at_slock);
     return sock;
 
 __err:
-    rt_mutex_release(at_socket_lock);
+    rt_mutex_release(at_slock);
     return RT_NULL;
 }
 
@@ -330,7 +339,7 @@ int at_socket(int domain, int type, int protocol)
 
     /* allocate and initialize a new AT socket */
     sock = alloc_socket();
-    if(!sock)
+    if(sock == RT_NULL)
     {
         LOG_E("Allocate a new AT socket failed!");
         return RT_NULL;
@@ -371,14 +380,16 @@ int at_closesocket(int socket)
     struct at_socket *sock;
     enum at_socket_state last_state;
 
-    if (!at_dev_ops)
+    if (at_dev_ops == RT_NULL)
     {
-        LOG_E("Please register AT device socket options first!");
         return -1;
     }
 
-    if ((sock = at_get_socket(socket)) == RT_NULL)
+    sock = at_get_socket(socket);
+    if (sock == RT_NULL)
+    {
         return -1;
+    }
 
     last_state = sock->state;
 
@@ -400,14 +411,16 @@ int at_shutdown(int socket, int how)
 {
     struct at_socket *sock;
 
-    if (!at_dev_ops)
+    if (at_dev_ops == RT_NULL)
     {
-        LOG_E("Please register AT device socket options first!");
         return -1;
     }
 
-    if ((sock = at_get_socket(socket)) == RT_NULL)
+    sock = at_get_socket(socket);
+    if (sock == RT_NULL)
+    {
         return -1;
+    }
 
     if (sock->state == AT_SOCKET_CONNECT)
     {
@@ -424,7 +437,9 @@ int at_bind(int socket, const struct sockaddr *name, socklen_t namelen)
 {
 
     if (at_get_socket(socket) == RT_NULL)
+    {
         return -1;
+    }
 
     return 0;
 }
@@ -460,7 +475,8 @@ static void at_recv_notice_cb(int socket, at_socket_evt_t event, const char *buf
     RT_ASSERT(bfsz);
     RT_ASSERT(event == AT_SOCKET_EVT_RECV);
 
-    if ((sock = at_get_socket(socket)) == RT_NULL)
+    sock = at_get_socket(socket);
+    if (sock == RT_NULL)
         return ;
 
     /* put receive buffer to receiver packet list */
@@ -485,7 +501,6 @@ static void at_closed_notice_cb(int socket, at_socket_evt_t event, const char *b
     at_do_event_changes(sock, AT_EVENT_RECV, RT_TRUE);
     at_do_event_changes(sock, AT_EVENT_ERROR, RT_TRUE);
 
-//    LOG_D("socket (%d) closed by remote");
     sock->state = AT_SOCKET_CLOSED;
     rt_sem_release(sock->recv_notice);
 }
@@ -497,14 +512,13 @@ int at_connect(int socket, const struct sockaddr *name, socklen_t namelen)
     char ipstr[16] = { 0 };
     int result = 0;
 
-    if (!at_dev_ops)
+    if (at_dev_ops == RT_NULL)
     {
-        LOG_E("Please register AT device socket options first!");
         return -1;
     }
 
     sock = at_get_socket(socket);
-    if (!sock)
+    if (sock == RT_NULL)
     {
         result = -1;
         goto __exit;
@@ -551,21 +565,19 @@ int at_recvfrom(int socket, void *mem, size_t len, int flags, struct sockaddr *f
     int result = 0;
     size_t recv_len = 0;
 
-    if (!mem || len == 0)
+    if (mem == RT_NULL || len == 0)
     {
         LOG_E("AT recvfrom input data or length error!");
-        result = -1;
-        goto __exit;
+        return -1;
     }
 
-    if (!at_dev_ops)
+    if (at_dev_ops == RT_NULL)
     {
-        LOG_E("Please register AT device socket options first!");
         return -1;
     }
 
     sock = at_get_socket(socket);
-    if (!sock)
+    if (sock == RT_NULL)
     {
         result = -1;
         goto __exit;
@@ -677,14 +689,13 @@ int at_sendto(int socket, const void *data, size_t size, int flags, const struct
     struct at_socket *sock;
     int len, result = 0;
 
-    if (!at_dev_ops)
+    if (at_dev_ops == RT_NULL)
     {
-        LOG_E("Please register AT device socket options first!");
         result = -1;
         goto __exit;
     }
 
-    if (!data || size == 0)
+    if (data == RT_NULL || size == 0)
     {
         LOG_E("AT sendto input data or size error!");
         result = -1;
@@ -692,7 +703,7 @@ int at_sendto(int socket, const void *data, size_t size, int flags, const struct
     }
 
     sock = at_get_socket(socket);
-    if (!sock)
+    if (sock == RT_NULL)
     {
         result = -1;
         goto __exit;
@@ -766,20 +777,19 @@ int at_send(int socket, const void *data, size_t size, int flags)
     return at_sendto(socket, data, size, flags, RT_NULL, 0);
 }
 
-
 int at_getsockopt(int socket, int level, int optname, void *optval, socklen_t *optlen)
 {
     struct at_socket *sock;
     int32_t timeout;
 
-    if (!optval || !optlen)
+    if (optval == RT_NULL || optlen == RT_NULL)
     {
         LOG_E("AT getsocketopt input option value or option length error!");
         return -1;
     }
 
     sock = at_get_socket(socket);
-    if (!sock)
+    if (sock == RT_NULL)
     {
         return -1;
     }
@@ -819,14 +829,14 @@ int at_setsockopt(int socket, int level, int optname, const void *optval, sockle
 {
     struct at_socket *sock;
 
-    if (!optval)
+    if (optval == RT_NULL)
     {
         LOG_E("AT setsockopt input option value error!");
         return -1;
     }
 
     sock = at_get_socket(socket);
-    if (!sock)
+    if (sock == RT_NULL)
     {
         return -1;
     }
@@ -915,15 +925,14 @@ struct hostent *at_gethostbyname(const char *name)
     static char s_hostname[DNS_MAX_NAME_LENGTH + 1];
     size_t idx = 0;
 
-    if (!name)
+    if (name == RT_NULL)
     {
         LOG_E("AT gethostbyname input name error!");
         return RT_NULL;
     }
 
-    if (!at_dev_ops)
+    if (at_dev_ops == RT_NULL)
     {
-        LOG_E("Please register AT device socket options first!");
         return RT_NULL;
     }
 
@@ -975,12 +984,13 @@ int at_getaddrinfo(const char *nodename, const char *servname,
     {
         return EAI_FAIL;
     }
-    if (!at_dev_ops)
+    *res = RT_NULL;
+
+    if (at_dev_ops == RT_NULL)
     {
-        LOG_E("Please register AT device socket options first!");
         return EAI_FAIL;
     }
-    *res = RT_NULL;
+
     if ((nodename == RT_NULL) && (servname == RT_NULL))
     {
         return EAI_NONAME;
@@ -1077,10 +1087,10 @@ int at_getaddrinfo(const char *nodename, const char *servname,
     struct sockaddr_in *sa4 = (struct sockaddr_in *) sa;
     /* set up sockaddr */
     sa4->sin_addr.s_addr = addr.u_addr.ip4.addr;
-    sa4->sin_family = AF_AT;
+    sa4->sin_family = AF_INET;
     sa4->sin_len = sizeof(struct sockaddr_in);
     sa4->sin_port = htons((u16_t )port_nr);
-    ai->ai_family = AF_AT;
+    ai->ai_family = AF_INET;
 
     /* set up addrinfo */
     if (hints != RT_NULL)
@@ -1106,9 +1116,13 @@ int at_getaddrinfo(const char *nodename, const char *servname,
 
 void at_freeaddrinfo(struct addrinfo *ai)
 {
-    if (ai != RT_NULL)
+    struct addrinfo *next;
+
+    while (ai != NULL)
     {
+        next = ai->ai_next;
         rt_free(ai);
+        ai = next;
     }
 }
 
@@ -1122,17 +1136,3 @@ void at_scoket_device_register(const struct at_device_ops *ops)
     RT_ASSERT(ops->set_event_cb);
     at_dev_ops = (struct at_device_ops *) ops;
 }
-
-static int at_socket_init(void)
-{
-    /* create AT socket lock */
-    at_socket_lock = rt_mutex_create("at_socket_lock", RT_IPC_FLAG_FIFO);
-    if (!at_socket_lock)
-    {
-        LOG_E("No memory for AT socket lock!");
-        return -RT_ENOMEM;
-    }
-
-    return RT_EOK;
-}
-INIT_COMPONENT_EXPORT(at_socket_init);
